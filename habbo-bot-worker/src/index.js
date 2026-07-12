@@ -249,6 +249,44 @@ function sparkline(values) {
 	return values.map((v) => SPARK_CHARS[Math.round(((v - min) / range) * (SPARK_CHARS.length - 1))]).join('');
 }
 
+// Line chart PNG via QuickChart (Workers have no canvas). Colors follow the
+// validated palette: series #2a78d6 on #fcfcfb, hairline grid, muted axis ink.
+function buildHistoryChartUrl(itemName, days, statsDate) {
+	const base = new Date(`${statsDate}T00:00:00Z`);
+	const labels = days.map((d) => {
+		const dt = new Date(base.getTime() + d.offset * 86400000);
+		return `${dt.getUTCMonth() + 1}/${dt.getUTCDate()}`;
+	});
+
+	const config = {
+		type: 'line',
+		data: {
+			labels,
+			datasets: [
+				{
+					data: days.map((d) => d.avgPrice),
+					borderColor: '#2a78d6',
+					backgroundColor: 'rgba(42,120,214,0.12)',
+					borderWidth: 2,
+					pointRadius: days.length < 5 ? 3 : 0,
+					fill: true,
+					lineTension: 0.25,
+				},
+			],
+		},
+		options: {
+			legend: { display: false },
+			title: { display: true, text: `${itemName} — avg sold price (credits)`, fontColor: '#0b0b0b' },
+			scales: {
+				xAxes: [{ gridLines: { display: false }, ticks: { fontColor: '#898781', maxTicksLimit: 7, maxRotation: 0 } }],
+				yAxes: [{ gridLines: { color: '#e1e0d9', drawBorder: false }, ticks: { fontColor: '#898781', maxTicksLimit: 6 } }],
+			},
+		},
+	};
+
+	return `https://quickchart.io/chart?w=700&h=360&bkg=${encodeURIComponent('#fcfcfb')}&c=${encodeURIComponent(JSON.stringify(config))}`;
+}
+
 async function handleHistoryCommand(chatId, itemName, env) {
 	if (!itemName) {
 		return await sendTelegram(chatId, 'Usage: /history <item name>', env);
@@ -286,9 +324,7 @@ async function handleHistoryCommand(chatId, itemName, env) {
 	const max = Math.max(...prices);
 	const spanDays = -days[0].offset;
 
-	let message = `📈 *${escapeMarkdown(item.name)}* — daily sold-price average, last ${spanDays} days
-
-\`${sparkline(prices)}\`
+	let caption = `📈 *${escapeMarkdown(item.name)}* — last ${spanDays} days
 
 💰 Latest avg: *${prices.at(-1)}* credits · ⬇️ Low: ${min} · ⬆️ High: ${max}
 📦 Sold: ${totalSold} items over ${days.length} trading days
@@ -305,10 +341,16 @@ async function handleHistoryCommand(chatId, itemName, env) {
 
 	if (snaps.length >= 2) {
 		const intraday = snaps.reverse().map((s) => s.current_price);
-		message += `\n\n🕐 Cheapest offer, last ${intraday.length} checks (30-min intervals):\n\`${sparkline(intraday)}\``;
+		caption += `\n\n🕐 Cheapest offer, last ${intraday.length} checks (30-min intervals):\n\`${sparkline(intraday)}\``;
 	}
 
-	await sendTelegram(chatId, message, env, 'Markdown');
+	const chartUrl = buildHistoryChartUrl(item.name, days, stats.statsDate);
+	const sent = await sendPhoto(chatId, chartUrl, caption, env, 'Markdown');
+
+	// Fall back to the text sparkline if the chart image can't be delivered
+	if (!sent) {
+		await sendTelegram(chatId, `${caption}\n\n\`${sparkline(prices)}\``, env, 'Markdown');
+	}
 }
 
 // --- Cron: check prices, record history, send alerts ---
@@ -418,6 +460,27 @@ async function fetchFurnidata() {
 }
 
 // --- Telegram ---
+
+// Send a photo by URL (Telegram fetches it). Returns true on success.
+async function sendPhoto(chatId, photoUrl, caption, env, parseMode = '') {
+	try {
+		const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendPhoto`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				chat_id: chatId,
+				photo: photoUrl,
+				caption,
+				parse_mode: parseMode,
+			}),
+		});
+		if (!res.ok) console.error('sendPhoto failed:', res.status, await res.text());
+		return res.ok;
+	} catch (e) {
+		console.error('sendPhoto error:', e);
+		return false;
+	}
+}
 
 async function sendTelegram(chatId, text, env, parseMode = '') {
 	await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
