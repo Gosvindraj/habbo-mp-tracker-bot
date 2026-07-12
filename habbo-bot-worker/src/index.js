@@ -251,24 +251,18 @@ function sparkline(values) {
 
 // Line chart PNG via QuickChart (Workers have no canvas). Colors follow the
 // validated palette: series #2a78d6 on #fcfcfb, hairline grid, muted axis ink.
-function buildHistoryChartUrl(itemName, days, statsDate) {
-	const base = new Date(`${statsDate}T00:00:00Z`);
-	const labels = days.map((d) => {
-		const dt = new Date(base.getTime() + d.offset * 86400000);
-		return `${dt.getUTCMonth() + 1}/${dt.getUTCDate()}`;
-	});
-
+function buildLineChartUrl(title, labels, values) {
 	const config = {
 		type: 'line',
 		data: {
 			labels,
 			datasets: [
 				{
-					data: days.map((d) => d.avgPrice),
+					data: values,
 					borderColor: '#2a78d6',
 					backgroundColor: 'rgba(42,120,214,0.12)',
 					borderWidth: 2,
-					pointRadius: days.length < 5 ? 3 : 0,
+					pointRadius: values.length < 5 ? 3 : 0,
 					fill: true,
 					lineTension: 0.25,
 				},
@@ -276,7 +270,7 @@ function buildHistoryChartUrl(itemName, days, statsDate) {
 		},
 		options: {
 			legend: { display: false },
-			title: { display: true, text: `${itemName} — avg sold price (credits)`, fontColor: '#0b0b0b' },
+			title: { display: true, text: title, fontColor: '#0b0b0b' },
 			scales: {
 				xAxes: [{ gridLines: { display: false }, ticks: { fontColor: '#898781', maxTicksLimit: 7, maxRotation: 0 } }],
 				yAxes: [{ gridLines: { color: '#e1e0d9', drawBorder: false }, ticks: { fontColor: '#898781', maxTicksLimit: 6 } }],
@@ -285,6 +279,21 @@ function buildHistoryChartUrl(itemName, days, statsDate) {
 	};
 
 	return `https://quickchart.io/chart?w=700&h=360&bkg=${encodeURIComponent('#fcfcfb')}&c=${encodeURIComponent(JSON.stringify(config))}`;
+}
+
+function buildHistoryChartUrl(itemName, days, statsDate) {
+	const base = new Date(`${statsDate}T00:00:00Z`);
+	const labels = days.map((d) => {
+		const dt = new Date(base.getTime() + d.offset * 86400000);
+		return `${dt.getUTCMonth() + 1}/${dt.getUTCDate()}`;
+	});
+	return buildLineChartUrl(`${itemName} — avg sold price (credits)`, labels, days.map((d) => d.avgPrice));
+}
+
+// Intraday chart from our 30-minute snapshots; recorded_at is UTC "YYYY-MM-DD HH:MM:SS"
+function buildIntradayChartUrl(itemName, snaps) {
+	const labels = snaps.map((s) => s.recorded_at.slice(11, 16));
+	return buildLineChartUrl(`${itemName} — cheapest open offer, 30-min checks (UTC)`, labels, snaps.map((s) => s.current_price));
 }
 
 async function handleHistoryCommand(chatId, itemName, env) {
@@ -324,7 +333,7 @@ async function handleHistoryCommand(chatId, itemName, env) {
 	const max = Math.max(...prices);
 	const spanDays = -days[0].offset;
 
-	let caption = `📈 *${escapeMarkdown(item.name)}* — last ${spanDays} days
+	const caption = `📈 *${escapeMarkdown(item.name)}* — last ${spanDays} days
 
 💰 Latest avg: *${prices.at(-1)}* credits · ⬇️ Low: ${min} · ⬆️ High: ${max}
 📦 Sold: ${totalSold} items over ${days.length} trading days
@@ -332,22 +341,22 @@ async function handleHistoryCommand(chatId, itemName, env) {
 
 	// Supplementary intraday view from our own 30-minute snapshots (watched items only)
 	const { results: snaps } = await env.DB.prepare(
-		`SELECT current_price FROM price_history
+		`SELECT current_price, recorded_at FROM price_history
 		 WHERE classname = ? AND item_type = ? AND current_price IS NOT NULL
 		 ORDER BY recorded_at DESC LIMIT 48`,
 	)
 		.bind(item.classname, item.type)
 		.all();
 
+	const charts = [buildHistoryChartUrl(item.name, days, stats.statsDate)];
 	if (snaps.length >= 2) {
-		const intraday = snaps.reverse().map((s) => s.current_price);
-		caption += `\n\n🕐 Cheapest offer, last ${intraday.length} checks (30-min intervals):\n\`${sparkline(intraday)}\``;
+		charts.push(buildIntradayChartUrl(item.name, snaps.reverse()));
 	}
 
-	const chartUrl = buildHistoryChartUrl(item.name, days, stats.statsDate);
-	const sent = await sendPhoto(chatId, chartUrl, caption, env, 'Markdown');
+	const sent =
+		charts.length > 1 ? await sendMediaGroup(chatId, charts, caption, env, 'Markdown') : await sendPhoto(chatId, charts[0], caption, env, 'Markdown');
 
-	// Fall back to the text sparkline if the chart image can't be delivered
+	// Fall back to the text sparkline if the chart images can't be delivered
 	if (!sent) {
 		await sendTelegram(chatId, `${caption}\n\n\`${sparkline(prices)}\``, env, 'Markdown');
 	}
@@ -460,6 +469,29 @@ async function fetchFurnidata() {
 }
 
 // --- Telegram ---
+
+// Send 2-10 photos as one album; the caption rides on the first item
+// (Telegram shows it under the album when only one item is captioned).
+// Returns true on success.
+async function sendMediaGroup(chatId, photoUrls, caption, env, parseMode = '') {
+	try {
+		const media = photoUrls.map((url, i) => ({
+			type: 'photo',
+			media: url,
+			...(i === 0 ? { caption, parse_mode: parseMode } : {}),
+		}));
+		const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMediaGroup`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: chatId, media }),
+		});
+		if (!res.ok) console.error('sendMediaGroup failed:', res.status, await res.text());
+		return res.ok;
+	} catch (e) {
+		console.error('sendMediaGroup error:', e);
+		return false;
+	}
+}
 
 // Send a photo by URL (Telegram fetches it). Returns true on success.
 async function sendPhoto(chatId, photoUrl, caption, env, parseMode = '') {
