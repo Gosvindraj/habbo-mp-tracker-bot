@@ -7,6 +7,7 @@ import {
 	findMatches,
 	fetchHabboStats,
 	buildPriceMessage,
+	escapeMarkdown,
 } from '../../lib/habbo.js';
 
 const WHITELIST_ID = [729525685, 5069716116];
@@ -27,14 +28,11 @@ export default {
 
 				if (payload.message && payload.message.text) {
 					const chatId = payload.message.chat.id;
-					const text = payload.message.text;
+					const text = payload.message.text.trim();
 
-					if (text.startsWith('/price')) {
-						const inputName = text.replace('/price', '').trim();
-						// Ack Telegram immediately; finish the work in the background
-						// so slow Habbo responses don't make Telegram re-deliver the webhook
-						ctx.waitUntil(handlePriceCommand(chatId, inputName, env));
-					}
+					// Ack Telegram immediately; finish the work in the background
+					// so slow Habbo responses don't make Telegram re-deliver the webhook
+					ctx.waitUntil(routeCommand(chatId, text, env));
 				}
 			} catch (e) {
 				console.error('Error processing webhook:', e);
@@ -43,39 +41,203 @@ export default {
 		}
 		return new Response('Habbo Bot is Active');
 	},
+
+	// Cron trigger: record prices for watched items and fire alerts
+	async scheduled(event, env, ctx) {
+		ctx.waitUntil(checkWatches(env));
+	},
 };
 
-// --- Commands ---
+// --- Command routing ---
+
+async function routeCommand(chatId, text, env) {
+	try {
+		if (text.startsWith('/price')) {
+			await handlePriceCommand(chatId, text.replace('/price', '').trim(), env);
+		} else if (text.startsWith('/watchlist')) {
+			await handleWatchlistCommand(chatId, env);
+		} else if (text.startsWith('/watch')) {
+			await handleWatchCommand(chatId, text.replace('/watch', '').trim(), env);
+		} else if (text.startsWith('/unwatch')) {
+			await handleUnwatchCommand(chatId, text.replace('/unwatch', '').trim(), env);
+		} else if (text.startsWith('/help') || text.startsWith('/start')) {
+			await sendTelegram(
+				chatId,
+				`Commands:
+/price <item name> — marketplace prices (partial names work)
+/watch <item name> <credits> — alert when price drops to/below the amount
+/unwatch <item name> — stop watching an item
+/watchlist — show your watched items`,
+				env,
+			);
+		}
+	} catch (e) {
+		console.error('routeCommand error:', e);
+		await sendTelegram(chatId, '⚠️ Something went wrong. Please try again later.', env);
+	}
+}
+
+// --- /price ---
 
 async function handlePriceCommand(chatId, inputName, env) {
-	try {
-		if (!inputName) {
-			return await sendTelegram(chatId, 'Usage: /price <item name>', env);
-		}
-
-		if (inputName.length > MAX_QUERY_LENGTH) {
-			return await sendTelegram(chatId, `❌ Search term is too long (max ${MAX_QUERY_LENGTH} characters). Try a shorter name.`, env);
-		}
-
-		await sendTelegram(chatId, `🔍 Checking marketplace for: ${inputName}...`, env);
-
-		const matches = findMatches(await fetchFurnidata(), inputName);
-
-		if (matches.length === 0) {
-			return await sendTelegram(chatId, `❌ Could not find any item matching "${inputName}".`, env);
-		}
-
-		const shown = matches.slice(0, MAX_MATCHES);
-		const overflow = matches.length - shown.length;
-
-		// Single batched call covers every shown match
-		const data = await fetchHabboStats(shown);
-
-		await sendTelegram(chatId, buildPriceMessage(shown, data, overflow), env, 'Markdown');
-	} catch (e) {
-		console.error('handlePriceCommand error:', e);
-		await sendTelegram(chatId, '⚠️ Failed to fetch data. Please try again later.', env);
+	if (!inputName) {
+		return await sendTelegram(chatId, 'Usage: /price <item name>', env);
 	}
+
+	if (inputName.length > MAX_QUERY_LENGTH) {
+		return await sendTelegram(chatId, `❌ Search term is too long (max ${MAX_QUERY_LENGTH} characters). Try a shorter name.`, env);
+	}
+
+	await sendTelegram(chatId, `🔍 Checking marketplace for: ${inputName}...`, env);
+
+	const matches = findMatches(await fetchFurnidata(), inputName);
+
+	if (matches.length === 0) {
+		return await sendTelegram(chatId, `❌ Could not find any item matching "${inputName}".`, env);
+	}
+
+	const shown = matches.slice(0, MAX_MATCHES);
+	const overflow = matches.length - shown.length;
+
+	// Single batched call covers every shown match
+	const data = await fetchHabboStats(shown);
+
+	await sendTelegram(chatId, buildPriceMessage(shown, data, overflow), env, 'Markdown');
+}
+
+// --- /watch ---
+
+async function handleWatchCommand(chatId, args, env) {
+	// Last token is the price threshold, everything before it is the item name
+	const parts = args.split(/\s+/);
+	const threshold = Number(parts.at(-1));
+	const itemName = parts.slice(0, -1).join(' ');
+
+	if (!itemName || !Number.isInteger(threshold) || threshold <= 0) {
+		return await sendTelegram(chatId, 'Usage: /watch <item name> <credits>\nExample: /watch throne 50', env);
+	}
+
+	const matches = findMatches(await fetchFurnidata(), itemName);
+	if (matches.length === 0) {
+		return await sendTelegram(chatId, `❌ Could not find any item matching "${itemName}".`, env);
+	}
+
+	// Best-ranked match wins (exact > prefix > substring)
+	const item = matches[0];
+
+	await env.DB.prepare(
+		`INSERT INTO watches (chat_id, classname, item_type, item_name, threshold)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT (chat_id, classname, item_type)
+		 DO UPDATE SET threshold = excluded.threshold, alerted = 0`,
+	)
+		.bind(chatId, item.classname, item.type, item.name, threshold)
+		.run();
+
+	await sendTelegram(
+		chatId,
+		`🔔 Watching *${escapeMarkdown(item.name)}* — you'll get an alert when its price drops to ${threshold} credits or below. (Checked every 30 minutes.)`,
+		env,
+		'Markdown',
+	);
+}
+
+// --- /unwatch ---
+
+async function handleUnwatchCommand(chatId, itemName, env) {
+	if (!itemName) {
+		return await sendTelegram(chatId, 'Usage: /unwatch <item name>', env);
+	}
+
+	const result = await env.DB.prepare(`DELETE FROM watches WHERE chat_id = ? AND lower(item_name) = lower(?)`)
+		.bind(chatId, itemName)
+		.run();
+
+	if (result.meta.changes > 0) {
+		await sendTelegram(chatId, `✅ Stopped watching "${itemName}".`, env);
+	} else {
+		await sendTelegram(chatId, `❌ You're not watching "${itemName}". Use /watchlist to see your watches (use the exact listed name).`, env);
+	}
+}
+
+// --- /watchlist ---
+
+async function handleWatchlistCommand(chatId, env) {
+	const { results } = await env.DB.prepare(`SELECT item_name, threshold, alerted FROM watches WHERE chat_id = ? ORDER BY item_name`)
+		.bind(chatId)
+		.all();
+
+	if (results.length === 0) {
+		return await sendTelegram(chatId, 'Your watchlist is empty. Add one with /watch <item name> <credits>.', env);
+	}
+
+	const lines = results.map(
+		(w) => `${w.alerted ? '🔔' : '👀'} *${escapeMarkdown(w.item_name)}* — alert at ≤ ${w.threshold} credits${w.alerted ? ' (triggered)' : ''}`,
+	);
+
+	await sendTelegram(chatId, `Your watchlist:\n\n${lines.join('\n')}`, env, 'Markdown');
+}
+
+// --- Cron: check prices, record history, send alerts ---
+
+async function checkWatches(env) {
+	const { results: watches } = await env.DB.prepare(`SELECT * FROM watches`).all();
+	if (watches.length === 0) return;
+
+	// Deduplicate items across users so each is fetched (and recorded) once
+	const itemKey = (w) => `${w.item_type}:${w.classname}`;
+	const uniqueItems = [...new Map(watches.map((w) => [itemKey(w), { classname: w.classname, type: w.item_type }])).values()];
+
+	const data = await fetchHabboStats(uniqueItems);
+
+	// Stats come back in the same order as the room/wall items sent
+	let roomIdx = 0;
+	let wallIdx = 0;
+	const statsByKey = new Map();
+	for (const item of uniqueItems) {
+		const stats = item.type === 'room' ? data?.roomItemData?.[roomIdx++] : data?.wallItemData?.[wallIdx++];
+		statsByKey.set(`${item.type}:${item.classname}`, stats ?? null);
+	}
+
+	const statements = [];
+
+	// Record a history snapshot per unique item
+	for (const item of uniqueItems) {
+		const stats = statsByKey.get(`${item.type}:${item.classname}`);
+		if (!stats) continue;
+		statements.push(
+			env.DB.prepare(`INSERT INTO price_history (classname, item_type, avg_price, current_price, open_offers) VALUES (?, ?, ?, ?, ?)`).bind(
+				item.classname,
+				item.type,
+				stats.averagePrice ?? null,
+				stats.currentPrice ?? null,
+				stats.currentOpenOffers ?? null,
+			),
+		);
+	}
+
+	// Evaluate each watch against the fresh price
+	for (const watch of watches) {
+		const stats = statsByKey.get(itemKey(watch));
+		if (!stats || !stats.currentOpenOffers) continue; // no offers = no buyable price
+
+		const price = stats.currentPrice;
+
+		if (price <= watch.threshold && !watch.alerted) {
+			await sendTelegram(
+				watch.chat_id,
+				`🔔 *Price alert!* ${escapeMarkdown(watch.item_name)} is now *${price} credits* (your threshold: ${watch.threshold}). ${stats.currentOpenOffers} listed.`,
+				env,
+				'Markdown',
+			);
+			statements.push(env.DB.prepare(`UPDATE watches SET alerted = 1 WHERE id = ?`).bind(watch.id));
+		} else if (price > watch.threshold && watch.alerted) {
+			// Price rose back above threshold — re-arm the alert
+			statements.push(env.DB.prepare(`UPDATE watches SET alerted = 0 WHERE id = ?`).bind(watch.id));
+		}
+	}
+
+	if (statements.length > 0) await env.DB.batch(statements);
 }
 
 // --- Furnidata cache ---

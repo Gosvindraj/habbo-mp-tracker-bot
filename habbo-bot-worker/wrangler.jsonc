@@ -12,7 +12,17 @@
 	},
 	"compatibility_flags": [
 		"nodejs_compat"
-	]
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "habbo-tracker",
+			"database_id": "69b11b5d-c489-48fb-839c-3e4fc9bf7997"
+		}
+	],
+	"triggers": {
+		"crons": ["*/30 * * * *"]
+	}
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
