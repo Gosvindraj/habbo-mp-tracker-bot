@@ -1,0 +1,14 @@
+# Secrets / environment
+.env*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Wrangler local state
+.wrangler/
+.dev.vars*
+!.dev.vars.example
+
+# Logs
+*.log

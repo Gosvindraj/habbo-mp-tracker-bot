@@ -1,0 +1,13 @@
+{
+  "name": "habbo-mp-tracker-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for Habbo marketplace price lookups",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
