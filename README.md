@@ -5,6 +5,10 @@ instant lookups, 30-day trend charts, inline search in any chat, and automated
 price-drop alerts — running 24/7 on Cloudflare's free tier with **zero runtime
 dependencies**.
 
+**Try it live: [@habbomptracker_bot](https://t.me/habbomptracker_bot)** — `/price`,
+`/history`, and inline search are open to everyone (rate-limited); watches are
+restricted in the public demo.
+
 ## Features
 
 | Command | What it does |
