@@ -7,6 +7,8 @@ import {
 	findMatches,
 	fetchHabboStats,
 	buildPriceMessage,
+	buildPriceBlock,
+	zipStats,
 	escapeMarkdown,
 } from '../../lib/habbo.js';
 
@@ -18,7 +20,7 @@ export default {
 		if (request.method === 'POST') {
 			try {
 				const payload = await request.json();
-				const userId = payload.message?.from?.id;
+				const userId = payload.message?.from?.id ?? payload.inline_query?.from?.id;
 
 				// Check if the user is whitelisted
 				if (!WHITELIST_ID.includes(userId)) {
@@ -26,7 +28,9 @@ export default {
 					return new Response('Unauthorized', { status: 200 });
 				}
 
-				if (payload.message && payload.message.text) {
+				if (payload.inline_query) {
+					ctx.waitUntil(handleInlineQuery(payload.inline_query, env));
+				} else if (payload.message && payload.message.text) {
 					const chatId = payload.message.chat.id;
 					const text = payload.message.text.trim();
 
@@ -179,6 +183,59 @@ async function handleWatchlistCommand(chatId, env) {
 	);
 
 	await sendTelegram(chatId, `Your watchlist:\n\n${lines.join('\n')}`, env, 'Markdown');
+}
+
+// --- Inline mode: @botname <query> in any chat ---
+
+const INLINE_MAX_RESULTS = 8;
+
+// Furni icon for result thumbnails; * in classnames maps to _ in icon filenames
+const iconUrl = (item) =>
+	item.revision ? `https://images.habbo.com/dcr/hof_furni/${item.revision}/${item.classname.replace(/\*/g, '_')}_icon.png` : undefined;
+
+async function handleInlineQuery(inlineQuery, env) {
+	try {
+		const query = inlineQuery.query.trim();
+		let results = [];
+
+		// Telegram fires an inline query on every keystroke; skip 0-1 char noise
+		if (query.length >= 2 && query.length <= MAX_QUERY_LENGTH) {
+			const matches = findMatches(await fetchFurnidata(), query).slice(0, INLINE_MAX_RESULTS);
+
+			if (matches.length > 0) {
+				const data = await fetchHabboStats(matches);
+
+				results = zipStats(matches, data).map(({ item, stats }, i) => ({
+					type: 'article',
+					id: String(i),
+					title: item.name,
+					description: stats
+						? `Avg ${stats.averagePrice} · Current ${stats.currentPrice} · ${stats.currentOpenOffers} listed`
+						: 'No marketplace data',
+					thumbnail_url: iconUrl(item),
+					input_message_content: {
+						message_text: buildPriceBlock(item.name, stats),
+						parse_mode: 'Markdown',
+					},
+				}));
+			}
+		}
+
+		await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/answerInlineQuery`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				inline_query_id: inlineQuery.id,
+				results,
+				cache_time: 120,
+				// Personal: results must not be served from Telegram's cache to
+				// other (non-whitelisted) users typing the same query
+				is_personal: true,
+			}),
+		});
+	} catch (e) {
+		console.error('handleInlineQuery error:', e);
+	}
 }
 
 // --- /history ---
