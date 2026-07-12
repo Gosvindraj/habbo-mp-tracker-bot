@@ -70,7 +70,7 @@ async function routeCommand(chatId, text, env) {
 /watch <item name> <credits> — alert when price drops to/below the amount
 /unwatch <item name> — stop watching an item
 /watchlist — show your watched items
-/history <item name> — price trend of a watched item`,
+/history <item name> — 30-day price trend of any item`,
 				env,
 			);
 		}
@@ -205,38 +205,51 @@ async function handleHistoryCommand(chatId, itemName, env) {
 	// Best-ranked match, same resolution as /watch
 	const item = matches[0];
 
-	// Last 48 snapshots = ~24h of 30-minute cron ticks
-	const { results } = await env.DB.prepare(
-		`SELECT current_price, avg_price, open_offers, recorded_at
-		 FROM price_history
+	// The stats API returns ~30 days of daily history alongside current prices
+	const data = await fetchHabboStats([item]);
+	const stats = item.type === 'room' ? data?.roomItemData?.[0] : data?.wallItemData?.[0];
+
+	// Days without sales carry no meaningful average price
+	const days = (stats?.history ?? [])
+		.map((d) => ({
+			offset: Number(d.dayOffset),
+			avgPrice: Number(d.averagePrice),
+			sold: Number(d.totalSoldItems),
+		}))
+		.filter((d) => d.sold > 0 && d.avgPrice > 0)
+		.sort((a, b) => a.offset - b.offset); // oldest → newest
+
+	if (days.length === 0) {
+		return await sendTelegram(chatId, `📉 No sales recorded for "${item.name}" in the last 30 days. It might be rarely traded or non-tradable.`, env);
+	}
+
+	const prices = days.map((d) => d.avgPrice);
+	const totalSold = days.reduce((sum, d) => sum + d.sold, 0);
+	const min = Math.min(...prices);
+	const max = Math.max(...prices);
+	const spanDays = -days[0].offset;
+
+	let message = `📈 *${escapeMarkdown(item.name)}* — daily sold-price average, last ${spanDays} days
+
+\`${sparkline(prices)}\`
+
+💰 Latest avg: *${prices.at(-1)}* credits · ⬇️ Low: ${min} · ⬆️ High: ${max}
+📦 Sold: ${totalSold} items over ${days.length} trading days
+🏷️ Cheapest offer now: ${stats.currentPrice} credits (${stats.currentOpenOffers} listed)`;
+
+	// Supplementary intraday view from our own 30-minute snapshots (watched items only)
+	const { results: snaps } = await env.DB.prepare(
+		`SELECT current_price FROM price_history
 		 WHERE classname = ? AND item_type = ? AND current_price IS NOT NULL
 		 ORDER BY recorded_at DESC LIMIT 48`,
 	)
 		.bind(item.classname, item.type)
 		.all();
 
-	if (results.length === 0) {
-		return await sendTelegram(
-			chatId,
-			`📉 No price history for "${item.name}" yet. History is recorded every 30 minutes for watched items — start with /watch ${item.name.toLowerCase()} <credits>.`,
-			env,
-		);
+	if (snaps.length >= 2) {
+		const intraday = snaps.reverse().map((s) => s.current_price);
+		message += `\n\n🕐 Cheapest offer, last ${intraday.length} checks (30-min intervals):\n\`${sparkline(intraday)}\``;
 	}
-
-	const rows = results.reverse(); // oldest → newest for the sparkline
-	const prices = rows.map((r) => r.current_price);
-	const latest = rows.at(-1);
-	const min = Math.min(...prices);
-	const max = Math.max(...prices);
-	const oldestAt = rows[0].recorded_at;
-
-	const message = `📈 *${escapeMarkdown(item.name)}* — last ${rows.length} checks (since ${oldestAt} UTC)
-
-\`${sparkline(prices)}\`
-
-🏷️ Latest: *${latest.current_price}* credits (${latest.open_offers} listed)
-⬇️ Low: ${min} · ⬆️ High: ${max}
-💰 Latest average: ${latest.avg_price} credits`;
 
 	await sendTelegram(chatId, message, env, 'Markdown');
 }
