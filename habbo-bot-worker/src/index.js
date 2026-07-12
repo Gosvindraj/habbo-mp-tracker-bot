@@ -12,7 +12,31 @@ import {
 	escapeMarkdown,
 } from '../../lib/habbo.js';
 
+// Users allowed to use stateful commands (/watch, /unwatch, /watchlist).
+// Read-only commands are public (portfolio demo) but rate-limited.
 const WHITELIST_ID = [729525685, 5069716116];
+
+// --- Rate limiting (public users only) ---
+// Per-isolate sliding window; resets when the isolate recycles, which is
+// acceptable for demo abuse protection (not a billing-grade limiter).
+const RATE_LIMIT_PER_MIN = 10;
+const rateBuckets = new Map();
+
+// Returns the caller's request count within the current 1-minute window
+function bumpRateCount(userId) {
+	const now = Date.now();
+	// Cheap pruning so the map can't grow unbounded
+	if (rateBuckets.size > 1000) {
+		for (const [id, b] of rateBuckets) if (now - b.start > 60000) rateBuckets.delete(id);
+	}
+	const bucket = rateBuckets.get(userId);
+	if (!bucket || now - bucket.start > 60000) {
+		rateBuckets.set(userId, { start: now, count: 1 });
+		return 1;
+	}
+	bucket.count++;
+	return bucket.count;
+}
 
 export default {
 	async fetch(request, env, ctx) {
@@ -21,22 +45,20 @@ export default {
 			try {
 				const payload = await request.json();
 				const userId = payload.message?.from?.id ?? payload.inline_query?.from?.id;
-
-				// Check if the user is whitelisted
-				if (!WHITELIST_ID.includes(userId)) {
-					console.warn(`Unauthorized access attempt by user ID: ${userId}`);
-					return new Response('Unauthorized', { status: 200 });
-				}
+				const isWhitelisted = WHITELIST_ID.includes(userId);
 
 				if (payload.inline_query) {
-					ctx.waitUntil(handleInlineQuery(payload.inline_query, env));
+					// Silently drop over-limit inline traffic (it fires per keystroke)
+					if (isWhitelisted || bumpRateCount(userId) <= RATE_LIMIT_PER_MIN * 2) {
+						ctx.waitUntil(handleInlineQuery(payload.inline_query, env));
+					}
 				} else if (payload.message && payload.message.text) {
 					const chatId = payload.message.chat.id;
 					const text = payload.message.text.trim();
 
 					// Ack Telegram immediately; finish the work in the background
 					// so slow Habbo responses don't make Telegram re-deliver the webhook
-					ctx.waitUntil(routeCommand(chatId, text, env));
+					ctx.waitUntil(routeCommand(chatId, text, env, isWhitelisted, userId));
 				}
 			} catch (e) {
 				console.error('Error processing webhook:', e);
@@ -54,16 +76,32 @@ export default {
 
 // --- Command routing ---
 
-async function routeCommand(chatId, text, env) {
+async function routeCommand(chatId, text, env, isWhitelisted, userId) {
 	try {
+		// Throttle public users; notify once per window, stay silent beyond that
+		if (!isWhitelisted) {
+			const count = bumpRateCount(userId);
+			if (count > RATE_LIMIT_PER_MIN) {
+				if (count === RATE_LIMIT_PER_MIN + 1) {
+					await sendTelegram(chatId, '⏳ Too many requests — try again in a minute.', env);
+				}
+				return;
+			}
+		}
+
 		if (text.startsWith('/price')) {
 			await handlePriceCommand(chatId, text.replace('/price', '').trim(), env);
-		} else if (text.startsWith('/watchlist')) {
-			await handleWatchlistCommand(chatId, env);
-		} else if (text.startsWith('/watch')) {
-			await handleWatchCommand(chatId, text.replace('/watch', '').trim(), env);
-		} else if (text.startsWith('/unwatch')) {
-			await handleUnwatchCommand(chatId, text.replace('/unwatch', '').trim(), env);
+		} else if (text.startsWith('/watchlist') || text.startsWith('/watch') || text.startsWith('/unwatch')) {
+			if (!isWhitelisted) {
+				return await sendTelegram(chatId, '🔒 Price alerts are disabled in the public demo. /price and /history are open — try those!', env);
+			}
+			if (text.startsWith('/watchlist')) {
+				await handleWatchlistCommand(chatId, env);
+			} else if (text.startsWith('/watch')) {
+				await handleWatchCommand(chatId, text.replace('/watch', '').trim(), env);
+			} else {
+				await handleUnwatchCommand(chatId, text.replace('/unwatch', '').trim(), env);
+			}
 		} else if (text.startsWith('/history')) {
 			await handleHistoryCommand(chatId, text.replace('/history', '').trim(), env);
 		} else if (text.startsWith('/help') || text.startsWith('/start')) {
@@ -71,10 +109,12 @@ async function routeCommand(chatId, text, env) {
 				chatId,
 				`Commands:
 /price <item name> — marketplace prices (partial names work)
+/history <item name> — 30-day price trend of any item
 /watch <item name> <credits> — alert when price drops to/below the amount
 /unwatch <item name> — stop watching an item
 /watchlist — show your watched items
-/history <item name> — 30-day price trend of any item`,
+
+Inline mode: type @ + this bot's name + an item name in any chat.`,
 				env,
 			);
 		}
