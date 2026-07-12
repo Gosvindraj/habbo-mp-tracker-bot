@@ -60,6 +60,8 @@ async function routeCommand(chatId, text, env) {
 			await handleWatchCommand(chatId, text.replace('/watch', '').trim(), env);
 		} else if (text.startsWith('/unwatch')) {
 			await handleUnwatchCommand(chatId, text.replace('/unwatch', '').trim(), env);
+		} else if (text.startsWith('/history')) {
+			await handleHistoryCommand(chatId, text.replace('/history', '').trim(), env);
 		} else if (text.startsWith('/help') || text.startsWith('/start')) {
 			await sendTelegram(
 				chatId,
@@ -67,7 +69,8 @@ async function routeCommand(chatId, text, env) {
 /price <item name> — marketplace prices (partial names work)
 /watch <item name> <credits> — alert when price drops to/below the amount
 /unwatch <item name> — stop watching an item
-/watchlist — show your watched items`,
+/watchlist — show your watched items
+/history <item name> — price trend of a watched item`,
 				env,
 			);
 		}
@@ -176,6 +179,66 @@ async function handleWatchlistCommand(chatId, env) {
 	);
 
 	await sendTelegram(chatId, `Your watchlist:\n\n${lines.join('\n')}`, env, 'Markdown');
+}
+
+// --- /history ---
+
+// Render values as a Unicode sparkline: ▁▂▃▄▅▆▇█
+const SPARK_CHARS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+function sparkline(values) {
+	const min = Math.min(...values);
+	const max = Math.max(...values);
+	const range = max - min || 1; // flat series renders as all-low bars
+	return values.map((v) => SPARK_CHARS[Math.round(((v - min) / range) * (SPARK_CHARS.length - 1))]).join('');
+}
+
+async function handleHistoryCommand(chatId, itemName, env) {
+	if (!itemName) {
+		return await sendTelegram(chatId, 'Usage: /history <item name>', env);
+	}
+
+	const matches = findMatches(await fetchFurnidata(), itemName);
+	if (matches.length === 0) {
+		return await sendTelegram(chatId, `❌ Could not find any item matching "${itemName}".`, env);
+	}
+
+	// Best-ranked match, same resolution as /watch
+	const item = matches[0];
+
+	// Last 48 snapshots = ~24h of 30-minute cron ticks
+	const { results } = await env.DB.prepare(
+		`SELECT current_price, avg_price, open_offers, recorded_at
+		 FROM price_history
+		 WHERE classname = ? AND item_type = ? AND current_price IS NOT NULL
+		 ORDER BY recorded_at DESC LIMIT 48`,
+	)
+		.bind(item.classname, item.type)
+		.all();
+
+	if (results.length === 0) {
+		return await sendTelegram(
+			chatId,
+			`📉 No price history for "${item.name}" yet. History is recorded every 30 minutes for watched items — start with /watch ${item.name.toLowerCase()} <credits>.`,
+			env,
+		);
+	}
+
+	const rows = results.reverse(); // oldest → newest for the sparkline
+	const prices = rows.map((r) => r.current_price);
+	const latest = rows.at(-1);
+	const min = Math.min(...prices);
+	const max = Math.max(...prices);
+	const oldestAt = rows[0].recorded_at;
+
+	const message = `📈 *${escapeMarkdown(item.name)}* — last ${rows.length} checks (since ${oldestAt} UTC)
+
+\`${sparkline(prices)}\`
+
+🏷️ Latest: *${latest.current_price}* credits (${latest.open_offers} listed)
+⬇️ Low: ${min} · ⬆️ High: ${max}
+💰 Latest average: ${latest.avg_price} credits`;
+
+	await sendTelegram(chatId, message, env, 'Markdown');
 }
 
 // --- Cron: check prices, record history, send alerts ---
