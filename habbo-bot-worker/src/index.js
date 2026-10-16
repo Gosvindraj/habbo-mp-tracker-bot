@@ -10,11 +10,13 @@ import {
 	buildPriceBlock,
 	zipStats,
 	escapeMarkdown,
+	isLtd,
+	latestHistoryOpenOffers,
 } from '../../lib/habbo.js';
 
 // Users allowed to use stateful commands (/watch, /unwatch, /watchlist).
 // Read-only commands are public (portfolio demo) but rate-limited.
-const WHITELIST_ID = [729525685, 5069716116];
+const WHITELIST_ID = [729525685];
 
 // --- Rate limiting (public users only) ---
 // Per-isolate sliding window; resets when the isolate recycles, which is
@@ -172,6 +174,16 @@ async function handleWatchCommand(chatId, args, env) {
 	// Best-ranked match wins (exact > prefix > substring)
 	const item = matches[0];
 
+	// The API never reports current offers for LTDs, so an alert could never fire
+	if (isLtd(item.classname)) {
+		return await sendTelegram(
+			chatId,
+			`🚫 *${escapeMarkdown(item.name)}* is an LTD. The Habbo API doesn't expose live LTD offers, so price alerts can't work for it. Use /price or /history to check its average instead.`,
+			env,
+			'Markdown',
+		);
+	}
+
 	await env.DB.prepare(
 		`INSERT INTO watches (chat_id, classname, item_type, item_name, threshold)
 		 VALUES (?, ?, ?, ?, ?)
@@ -233,6 +245,17 @@ const INLINE_MAX_RESULTS = 8;
 const iconUrl = (item) =>
 	item.revision ? `https://images.habbo.com/dcr/hof_furni/${item.revision}/${item.classname.replace(/\*/g, '_')}_icon.png` : undefined;
 
+// One-line summary under each inline result title
+function inlineDescription(item, stats) {
+	if (!stats) return 'No marketplace data';
+	const avg = stats.averagePrice > 0 ? `Avg ${stats.averagePrice}` : 'No sales in 30 days';
+	if (isLtd(item.classname)) {
+		const listed = latestHistoryOpenOffers(stats);
+		return `LTD · ${avg}${listed === null ? '' : ` · ~${listed} listed`}`;
+	}
+	return `${avg} · Current ${stats.currentPrice} · ${stats.currentOpenOffers} listed`;
+}
+
 async function handleInlineQuery(inlineQuery, env) {
 	try {
 		const query = inlineQuery.query.trim();
@@ -249,12 +272,10 @@ async function handleInlineQuery(inlineQuery, env) {
 					type: 'article',
 					id: String(i),
 					title: item.name,
-					description: stats
-						? `Avg ${stats.averagePrice} · Current ${stats.currentPrice} · ${stats.currentOpenOffers} listed`
-						: 'No marketplace data',
+					description: inlineDescription(item, stats),
 					thumbnail_url: iconUrl(item),
 					input_message_content: {
-						message_text: buildPriceBlock(item.name, stats),
+						message_text: buildPriceBlock(item, stats),
 						parse_mode: 'Markdown',
 					},
 				}));
@@ -377,7 +398,11 @@ async function handleHistoryCommand(chatId, itemName, env) {
 
 💰 Latest avg: *${prices.at(-1)}* credits · ⬇️ Low: ${min} · ⬆️ High: ${max}
 📦 Sold: ${totalSold} items over ${days.length} trading days
-🏷️ Cheapest offer now: ${stats.currentPrice} credits (${stats.currentOpenOffers} listed)`;
+${
+		isLtd(item.classname)
+			? `🔸 Listed: ~${latestHistoryOpenOffers(stats) ?? 0} items (latest daily count; live LTD offers aren't exposed)`
+			: `🏷️ Cheapest offer now: ${stats.currentPrice} credits (${stats.currentOpenOffers} listed)`
+	}`;
 
 	// Supplementary intraday view from our own 30-minute snapshots (watched items only)
 	const { results: snaps } = await env.DB.prepare(
